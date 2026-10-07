@@ -1,0 +1,455 @@
+from __future__ import annotations
+import math
+import os
+from dataclasses import dataclass
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+# ---------------------------------------------------------------------------
+# CONSTANTES
+# ---------------------------------------------------------------------------
+RHO_AIR = 1.225     # kg/m^3  (ar, nível do mar)
+NU_AIR  = 1.46e-5   # m^2/s   (viscosidade cinemática ~15 °C)
+CP_BETZ = 16.0 / 27.0
+
+PERFIS      = ["NACA 0012", "NACA 0018", "NACA 0025", "SD7080"]
+RE_LIST     = [1.0e5, 2.0e5, 3.0e5]
+PASTA_POLAR = "polars"
+
+TSR_REF   = 3.75    # TSR nominal de projeto
+SIGMA_REF = 0.3     # solidez de projeto
+CP_PROJ   = 0.48    # Cp de projeto (melhor perfil, conforme o manuscrito)
+
+
+# ---------------------------------------------------------------------------
+# 1) POLARES
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Polar:
+    nome: str
+    Re: float
+    alpha: list[float]      # graus
+    cl: list[float]
+    cd: list[float]
+    origem: str             # "xfoil" | "demo"
+
+    def _interp(self, x: float, xs: list[float], ys: list[float]) -> float:
+        """Interpolação linear; extrapolação constante nas bordas."""
+        if x <= xs[0]:
+            return ys[0]
+        if x >= xs[-1]:
+            return ys[-1]
+        i = 0
+        while i < len(xs) - 2 and x > xs[i + 1]:
+            i += 1
+        t = (x - xs[i]) / (xs[i + 1] - xs[i])
+        return ys[i] + t * (ys[i + 1] - ys[i])
+
+    def cl_cd(self, alpha_deg: float) -> tuple[float, float]:
+        return (self._interp(alpha_deg, self.alpha, self.cl),
+                self._interp(alpha_deg, self.alpha, self.cd))
+
+    def resumo(self) -> dict:
+        razao = [cl / cd if cd > 0 else 0.0
+                 for cl, cd in zip(self.cl, self.cd)]
+        i = razao.index(max(razao))
+        return {"Cl/Cd max": max(razao),
+                "alpha* (deg)": self.alpha[i],
+                "Cl max": max(self.cl),
+                "Cl em alpha*": self.cl[i]}
+
+
+# --- Polares sintéticas de demonstração -----------------------------------
+_DEMO = {
+    "NACA 0012": dict(a0=0.105, ast=10.0, clmax=0.75, cd0=0.010, k=0.020),
+    "NACA 0018": dict(a0=0.098, ast=12.5, clmax=0.90, cd0=0.011, k=0.022),
+    "NACA 0025": dict(a0=0.090, ast=15.0, clmax=0.95, cd0=0.017, k=0.030),
+    "SD7080"   : dict(a0=0.110, ast=13.0, clmax=1.05, cd0=0.009, k=0.018),
+}
+
+
+def _polar_demo(nome: str, Re: float) -> Polar:
+    p = _DEMO[nome]
+    f = 0.90 + 0.10 * math.log10(Re / 1.0e5) / math.log10(3.0)
+    clmax = p["clmax"] * f
+    alphas, cls, cds = [], [], []
+    for a in [x * 0.5 for x in range(-40, 61)]:      # -20 a +30 graus
+        if abs(a) <= p["ast"]:
+            cl = p["a0"] * a
+        elif a > p["ast"]:
+            cl = clmax - (clmax - 0.4) * ((a - p["ast"]) / (20.0 - p["ast"]))
+        else:
+            cl = -clmax + (-0.4 + clmax) * ((a + p["ast"]) / (20.0 - p["ast"]))
+        cd = p["cd0"] * f + p["k"] * cl * cl
+        if abs(a) > p["ast"]:
+            cd += 0.30 * ((abs(a) - p["ast"]) / 10.0) ** 2
+        alphas.append(a)
+        cls.append(cl)
+        cds.append(cd)
+    return Polar(nome, Re, alphas, cls, cds, origem="demo")
+
+
+def _parse_xfoil(caminho: str, nome: str, Re: float) -> Polar:
+    """Lê polar XFoil (cabeçalhos ignorados; usa as colunas alpha, CL, CD)
+    ou CSV simples com 3 colunas numéricas."""
+    alphas, cls, cds = [], [], []
+    with open(caminho, "r", encoding="utf-8", errors="replace") as fh:
+        for linha in fh:
+            partes = linha.split()
+            if len(partes) < 3:
+                continue
+            try:
+                a = float(partes[0])
+                cl = float(partes[1])
+                cd = float(partes[2])
+            except ValueError:
+                continue
+            alphas.append(a)
+            cls.append(cl)
+            cds.append(cd)
+    if len(alphas) < 3:
+        raise ValueError(f"polar sem dados suficientes: {caminho}")
+    return Polar(nome, Re, alphas, cls, cds, origem="xfoil")
+
+
+def carregar_polar(nome: str, Re: float, pasta: str = PASTA_POLAR) -> Polar:
+    base = nome.replace(" ", "").replace("-", "")
+    for ext in (".csv", ".txt", ".dat"):
+        caminho = os.path.join(pasta, f"{base}_Re{int(Re)}{ext}")
+        if os.path.exists(caminho):
+            return _parse_xfoil(caminho, nome, Re)
+    return _polar_demo(nome, Re)
+
+
+# ---------------------------------------------------------------------------
+# 2) DIMENSIONAMENTO (Fase 2 do manuscrito — inalterado)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Parametros:
+    P_nominal: float = 1000.0   # W  (classe 500–1000)
+    V_nominal: float = 10.0     # m/s ≈ 36 km/h
+    Cp: float        = CP_PROJ
+    N_pas: int       = 3
+    AR: float        = 2.6      # H/D
+    sigma: float     = SIGMA_REF
+    TSR: float       = TSR_REF
+    rho: float       = RHO_AIR
+    nu: float        = NU_AIR
+
+    def __post_init__(self) -> None:
+        if not (500.0 <= self.P_nominal <= 1000.0):
+            raise ValueError("P_nominal deve estar entre 500 e 1000 W.")
+        if self.Cp >= CP_BETZ:
+            raise ValueError(f"Cp deve ser menor que o limite de Betz "
+                             f"({CP_BETZ:.3f}).")
+        if self.AR <= 0 or self.sigma <= 0 or self.TSR <= 0:
+            raise ValueError("AR, solidez e TSR devem ser positivos.")
+
+
+@dataclass
+class Rotor:
+    D: float
+    H: float
+    c: float
+    A: float
+    P_nominal: float
+    V_nominal: float
+    Cp: float
+    TSR: float
+    rho: float
+    nu: float
+
+    @property
+    def R(self) -> float:
+        return self.D / 2.0
+
+    def potencia(self, V: float, limitar: bool = True,
+                 cp: float | None = None) -> float:
+        cp = cp if cp is not None else self.Cp
+        P = 0.5 * self.rho * self.A * V**3 * cp
+        return min(P, self.P_nominal) if limitar else P
+
+    def rpm(self, V: float) -> float:
+        return (self.TSR * V / self.R) * 60.0 / (2.0 * math.pi)
+
+    def re_corda(self, V: float, tsr: float | None = None) -> float:
+        tsr = tsr if tsr is not None else self.TSR
+        W = V * math.sqrt(tsr * tsr + 1.0)      # |W| médio característico
+        return W * self.c / self.nu
+
+
+def dimensionar(p: Parametros) -> Rotor:
+    A = p.P_nominal / (0.5 * p.rho * p.V_nominal**3 * p.Cp)   # A = D·H
+    D = math.sqrt(A / p.AR)                    # A = AR·D^2
+    H = p.AR * D
+    c = p.sigma * D / p.N_pas                  # sigma = N·c/D
+    r = Rotor(D=D, H=H, c=c, A=A,
+              P_nominal=p.P_nominal, V_nominal=p.V_nominal,
+              Cp=p.Cp, TSR=p.TSR, rho=p.rho, nu=p.nu)
+    assert math.isclose(r.c * p.N_pas / r.D, p.sigma, rel_tol=1e-9)
+    assert math.isclose(r.H / r.D, p.AR, rel_tol=1e-9)
+    return r
+
+
+# ---------------------------------------------------------------------------
+# 3) MODELO CINEMÁTICO (sem indução) — Cp relativo por perfil
+# ---------------------------------------------------------------------------
+
+def cp_cinematica(polar: Polar, tsr: float, sigma: float, n: int = 1440) -> float:
+    """Cp estimado por perfil (ranking relativo — não usar como valor absoluto).
+    Integração por soma de Riemann sobre [0, 2pi]."""
+    soma = 0.0
+    for i in range(n):
+        th = 2.0 * math.pi * i / n
+        w2 = 1.0 + tsr * tsr + 2.0 * tsr * math.sin(th)      # (W/V)^2
+        alfa = math.degrees(math.atan2(math.cos(th), tsr + math.sin(th)))
+        cl, cd = polar.cl_cd(alfa)
+        ct = cl * math.sin(math.radians(alfa)) - cd * math.cos(math.radians(alfa))
+        soma += w2 * ct
+    return sigma * tsr * soma / n
+
+
+def comparar_perfis(tsr_ref: float = TSR_REF, sigma: float = SIGMA_REF) -> dict:
+    res = {}
+    for nome in PERFIS:
+        res[nome] = {}
+        for Re in RE_LIST:
+            pol = carregar_polar(nome, Re)
+            r = pol.resumo()
+            r["Cp_kin"] = cp_cinematica(pol, tsr_ref, sigma)
+            r["fonte"] = pol.origem
+            res[nome][Re] = r
+    return res
+
+
+# ---------------------------------------------------------------------------
+# 4) EXECUÇÃO PRINCIPAL
+# ---------------------------------------------------------------------------
+
+# Realiza os cálculos principais
+p = Parametros()
+rotor = dimensionar(p)
+res = comparar_perfis()
+
+
+# ---------------------------------------------------------------------------
+# 5) VISUALIZAÇÕES
+# ---------------------------------------------------------------------------
+
+def plotar(res: dict, rotor: Rotor) -> None:
+    """Gera todos os gráficos de análise."""
+
+    # --- Gráfico 1: Cl/Cd vs alpha para cada Re ---
+    fig1, axs1 = plt.subplots(1, len(RE_LIST), figsize=(5 * len(RE_LIST), 5), sharey=True)
+    if len(RE_LIST) == 1:
+        axs1 = [axs1]
+    fig1.suptitle('Cl/Cd vs. Ângulo de Ataque (alpha) para diferentes Reynolds', fontsize=16)
+
+    for j, Re in enumerate(RE_LIST):
+        ax = axs1[j]
+        for nome in PERFIS:
+            pol = carregar_polar(nome, Re)
+            razao = [cl / cd if cd > 0 else 0.0
+                     for cl, cd in zip(pol.cl, pol.cd)]
+            ax.plot(pol.alpha, razao, lw=1.4, label=nome)
+        ax.axvline(0, color='k', lw=0.5)
+        ax.set_title(f"Re = {Re:.0e}")
+        ax.set_xlabel("alpha (graus)")
+        if j == 0:
+            ax.set_ylabel("Cl/Cd")
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=8)
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.show()
+
+    # --- Gráfico 2: Cp_kin vs TSR (Re = 3e5) ---
+    fig2, ax2 = plt.subplots(figsize=(10, 6))
+    for nome in PERFIS:
+        pol = carregar_polar(nome, 3.0e5)
+        tsrs = np.linspace(1.0, 6.0, 50)
+        cps = [cp_cinematica(pol, t, SIGMA_REF) for t in tsrs]
+        ax2.plot(tsrs, cps, lw=1.6, label=nome)
+    ax2.axvline(TSR_REF, ls="--", c="k", lw=0.8, label=f"TSR projeto = {TSR_REF}")
+    ax2.set_title("Coeficiente de Potência Cinemático (Cp_kin) vs. TSR (Re = 3e5)", fontsize=16)
+    ax2.set_xlabel("Tip Speed Ratio (TSR)")
+    ax2.set_ylabel("Cp_kin")
+    ax2.grid(alpha=0.3)
+    ax2.legend(fontsize=10)
+    plt.tight_layout()
+    plt.show()
+
+    # --- Gráfico 3: Barras — Cp_kin @ TSR 3.75, por Re ---
+    fig3, ax3 = plt.subplots(figsize=(12, 7))
+    x = np.arange(len(PERFIS))
+    w = 0.2
+    for j, Re in enumerate(RE_LIST):
+        vals = [res[n][Re]["Cp_kin"] for n in PERFIS]
+        ax3.bar(x + (j - 1) * w, vals, w, label=f"Re = {Re:.0e}")
+        for i, val in enumerate(vals):
+            ax3.text(x[i] + (j - 1) * w, val + 0.01, f'{val:.3f}',
+                     ha='center', va='bottom', fontsize=8)
+    ax3.set_xticks(x)
+    ax3.set_xticklabels(PERFIS, rotation=25, ha='right', fontsize=10)
+    ax3.set_ylabel("Cp_kin @ TSR 3.75")
+    ax3.set_title("Comparação do Cp_kin por Perfil e Número de Reynolds (TSR = 3.75)", fontsize=16)
+    ax3.grid(alpha=0.3, axis="y")
+    ax3.legend(fontsize=10)
+    plt.tight_layout()
+    plt.show()
+
+    # --- Gráfico 4: Potência entregue por perfil (tabela visual) ---
+    fig4, ax4 = plt.subplots(figsize=(14, len(PERFIS) * 0.5 + 2))
+    ax4.axis('off')
+    ax4.set_title('Potência Entregue por Perfil (W) para diferentes velocidades (Cp escalado)',
+                  fontsize=16)
+
+    cp_kin_best = max(res[n][3.0e5]["Cp_kin"] for n in PERFIS)
+    Vs_kmh = (10, 20, 30, 36, 50, 70)
+    data = []
+    column_headers = ["V (km/h)"] + PERFIS
+
+    for v_kmh in Vs_kmh:
+        row_data = [v_kmh]
+        for nome in PERFIS:
+            fator = res[nome][3.0e5]["Cp_kin"] / cp_kin_best
+            P = rotor.potencia(v_kmh / 3.6, limitar=True, cp=CP_PROJ * fator)
+            row_data.append(round(P, 0))
+        data.append(row_data)
+
+    df_power = pd.DataFrame(data, columns=column_headers)
+    table = ax4.table(cellText=df_power.values, colLabels=df_power.columns,
+                      loc='center', cellLoc='center')
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1.2, 1.2)
+    plt.tight_layout()
+    plt.show()
+
+    # --- Gráfico 5: Reynolds de corda em operação ---
+    fig5, ax5 = plt.subplots(figsize=(10, 6))
+    velocities_kmh = np.array([10.0, 36.0, 70.0])
+    re_values = [rotor.re_corda(v / 3.6) for v in velocities_kmh]
+
+    ax5.bar([f'{v} km/h' for v in velocities_kmh], re_values,
+            color=['skyblue', 'lightcoral', 'lightgreen'])
+    ax5.axhline(y=1.0e5, color='r', linestyle='--', label='Limite Inferior (1e5)')
+    ax5.axhline(y=3.0e5, color='r', linestyle='--', label='Limite Superior (3e5)')
+
+    ax5.set_title('Reynolds de Corda em Operação para Diferentes Velocidades', fontsize=16)
+    ax5.set_xlabel('Velocidade do Vento')
+    ax5.set_ylabel('Reynolds de Corda')
+    ax5.ticklabel_format(style='sci', axis='y', scilimits=(0, 0))
+    ax5.grid(axis='y', alpha=0.7)
+    ax5.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+def plotar_comparacao_cl_alpha(res: dict) -> None:
+    """Gráficos adicionais: Cl_max e alpha* por perfil e Reynolds."""
+
+    cl_max_data = []
+    alpha_star_data = []
+
+    for nome in PERFIS:
+        for Re in RE_LIST:
+            polar_info = res[nome][Re]
+            cl_max_data.append({'Perfil': nome, 'Re': Re, 'Cl_max': polar_info['Cl max']})
+            alpha_star_data.append({'Perfil': nome, 'Re': Re,
+                                    'alpha* (deg)': polar_info['alpha* (deg)']})
+
+    df_cl_max = pd.DataFrame(cl_max_data)
+    df_alpha_star = pd.DataFrame(alpha_star_data)
+
+    # --- Gráfico 6: Cl_max por perfil e Reynolds ---
+    fig_cl_max, ax_cl_max = plt.subplots(figsize=(12, 7))
+    bar_width = 0.2
+    index = np.arange(len(PERFIS))
+
+    for i, Re in enumerate(RE_LIST):
+        re_str = f'{Re:.0e}'
+        cl_max_values = df_cl_max[df_cl_max['Re'] == Re]['Cl_max'].values
+        ax_cl_max.bar(index + i * bar_width, cl_max_values, bar_width,
+                      label=f'Re = {re_str}')
+        for j, val in enumerate(cl_max_values):
+            ax_cl_max.text(index[j] + i * bar_width, val + 0.01, f'{val:.2f}',
+                           ha='center', va='bottom', fontsize=8)
+
+    ax_cl_max.set_xlabel('Perfil')
+    ax_cl_max.set_ylabel('Cl_max')
+    ax_cl_max.set_title('Comparação de Coeficiente de Sustentação Máximo (Cl_max) '
+                        'por Perfil e Reynolds')
+    ax_cl_max.set_xticks(index + bar_width)
+    ax_cl_max.set_xticklabels(PERFIS, rotation=25, ha='right')
+    ax_cl_max.legend()
+    ax_cl_max.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    plt.show()
+
+    # --- Gráfico 7: alpha* por perfil e Reynolds ---
+    fig_alpha_star, ax_alpha_star = plt.subplots(figsize=(12, 7))
+
+    for i, Re in enumerate(RE_LIST):
+        re_str = f'{Re:.0e}'
+        alpha_star_values = df_alpha_star[df_alpha_star['Re'] == Re]['alpha* (deg)'].values
+        ax_alpha_star.bar(index + i * bar_width, alpha_star_values, bar_width,
+                          label=f'Re = {re_str}')
+        for j, val in enumerate(alpha_star_values):
+            ax_alpha_star.text(index[j] + i * bar_width, val + 0.01, f'{val:.1f}',
+                               ha='center', va='bottom', fontsize=8)
+
+    ax_alpha_star.set_xlabel('Perfil')
+    ax_alpha_star.set_ylabel('alpha* (graus)')
+    ax_alpha_star.set_title('Comparação de Ângulo de Ataque para Melhor Cl/Cd (alpha*) '
+                            'por Perfil e Reynolds')
+    ax_alpha_star.set_xticks(index + bar_width)
+    ax_alpha_star.set_xticklabels(PERFIS, rotation=25, ha='right')
+    ax_alpha_star.legend()
+    ax_alpha_star.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    plt.show()
+
+
+# ---------------------------------------------------------------------------
+# 6) EXECUÇÃO DOS GRÁFICOS
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("RESULTADOS DO DIMENSIONAMENTO DO ROTOR")
+    print("=" * 60)
+    print(f"Diâmetro (D):      {rotor.D:.3f} m")
+    print(f"Altura (H):        {rotor.H:.3f} m")
+    print(f"Corda (c):         {rotor.c:.3f} m")
+    print(f"Área varrida (A):  {rotor.A:.3f} m²")
+    print(f"Raio (R):          {rotor.R:.3f} m")
+    print(f"Potência nominal:  {rotor.P_nominal:.1f} W")
+    print(f"RPM @ V_nominal:   {rotor.rpm(rotor.V_nominal):.1f} rpm")
+    print(f"Re_corda @ V_nom:  {rotor.re_corda(rotor.V_nominal):.1e}")
+    print()
+
+    print("=" * 60)
+    print("COMPARAÇÃO DE PERFIS (Cp_kin @ TSR = 3.75)")
+    print("=" * 60)
+    for nome in PERFIS:
+        print(f"\n{nome}:")
+        for Re in RE_LIST:
+            info = res[nome][Re]
+            print(f"  Re = {Re:.0e}: Cp_kin = {info['Cp_kin']:.4f}  |  "
+                  f"Cl/Cd max = {info['Cl/Cd max']:.1f}  |  "
+                  f"Cl_max = {info['Cl max']:.2f}  |  "
+                  f"fonte = {info['fonte']}")
+
+    print("\n" + "=" * 60)
+    print("GERANDO GRÁFICOS...")
+    print("=" * 60)
+
+    # Gera todos os gráficos
+    plotar(res, rotor)
+    plotar_comparacao_cl_alpha(res)
+
+    print("\nAnálise concluída com sucesso!")
