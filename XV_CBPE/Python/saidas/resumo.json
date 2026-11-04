@@ -1,0 +1,93 @@
+{
+  "parametros": {
+    "pasta_polar": "/content/drive/MyDrive/Projeto_EPE-Manufatura_WES_2026/Atividades/XV_CBPE/codigo/polars",
+    "outdir": "/content/drive/MyDrive/Projeto_EPE-Manufatura_WES_2026/Atividades/XV_CBPE/codigo/saidas",
+    "formato": "png",
+    "dpi": 200,
+    "mostrar": true,
+    "perfis": [
+      "NACA 0012",
+      "NACA 0018",
+      "NACA 0025",
+      "SD7080"
+    ],
+    "potencia": 1000.0,
+    "vento_nominal": 10.0,
+    "cp": 0.48,
+    "pas": 3,
+    "ar": 2.6,
+    "sigma": 0.3,
+    "tsr": 3.75,
+    "k_weibull": 2.0,
+    "A_weibull": 6.0,
+    "sem_graficos": false
+  },
+  "rotor": {
+    "D": 1.1437725271791936,
+    "H": 2.9738085706659034,
+    "c": 0.11437725271791936,
+    "A": 3.401360544217687,
+    "R": 0.5718862635895968,
+    "rpm": 626.1710496577814,
+    "torque_Nm": 15.250300362389249,
+    "Re_corda": 304043.2281628873
+  },
+  "perfis_analisados": [
+    "NACA 0012",
+    "NACA 0018",
+    "NACA 0025",
+    "SD7080"
+  ],
+  "perfis_pendentes": [],
+  "fatores_perfil": {
+    "NACA 0012": 0.3775916178524124,
+    "NACA 0018": 0.6841075422594163,
+    "NACA 0025": 1.0,
+    "SD7080": 0.8314955386898408
+  },
+  "melhor_perfil": "NACA 0025",
+  "aep": {
+    "AEP (kWh/ano)": 2174.8521737835613,
+    "Fator de capacidade": 0.24827079609401384,
+    "Weibull k": 2.0,
+    "Weibull A (m/s)": 6.0,
+    "Status dos parâmetros": "provisórios (N/A) até a coleta anemométrica"
+  },
+  "referencia_artigo": {
+    "indicador_re3e5": {
+      "SD7080": 2.3637,
+      "NACA 0025": 2.0729,
+      "NACA 0018": 1.9202,
+      "NACA 0012": 1.3389
+    },
+    "indicador_re3e5_descricao": "valores reportados no artigo para Re = 3 x 10^5. A natureza exata do indicador está pendente de confirmação no texto integral da fonte",
+    "indicador_re3e5_desvios_pct": {
+      "NACA 0025": 14.0,
+      "NACA 0018": 23.0,
+      "NACA 0012": 77.0
+    },
+    "cl_cd_max_naca0025": 22.1,
+    "cl_max_reportado": {
+      "valores": [
+        1.43,
+        1.35
+      ],
+      "atribuicao": null
+    },
+    "ranking_artigo": [
+      "SD7080",
+      "NACA 0025",
+      "NACA 0018",
+      "NACA 0012"
+    ],
+    "reynolds_operacao": 300000.0,
+    "rotacao_operacao_rpm": 626.2,
+    "dimensoes_artigo": {
+      "D": 1.144,
+      "H": 2.974,
+      "c": 0.114,
+      "A": 3.401,
+      "R": 0.572
+    }
+  }
+}
